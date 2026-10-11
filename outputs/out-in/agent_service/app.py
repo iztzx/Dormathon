@@ -1,6 +1,7 @@
 """Local single-owner FastAPI runtime; not a multi-tenant production perimeter."""
 from __future__ import annotations
 import asyncio
+import csv
 import hashlib
 import os
 import re
@@ -8,6 +9,7 @@ import secrets
 import shutil
 import zipfile
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from pathlib import Path
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import FileResponse
@@ -15,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from agent_service.store import Store, TERMINAL
 from agent_service.orchestrator import ROOT, UnderwritingEngine, hash_file
-from tools.reconciliation_tool import EvidenceError, money, dec
+from tools.reconciliation_tool import EvidenceError, money, dec, read_statement
 from agent_service.myinvois_client import MyInvoisConfig, MyInvoisClient, enabled as myinvois_enabled, parse_document_ids
 
 WORKSPACE = Path(os.environ.get("OUT_IN_WORKSPACE", ROOT / "workspace")).resolve()
@@ -186,26 +188,50 @@ DEMO_RUN_TERMS = {"requested_limit": "40000.00", "duration_months": 12,
 
 
 @app.post("/api/v2/demo-run", status_code=202, dependencies=[Depends(auth)])
-async def demo_run():
-    """One action, end-to-end: stage the generated synthetic dossier with the
-    canonical demo terms and run the same validated intake/scheduler path as a
-    manual upload. Demo mode only; settlement remains simulated."""
+async def demo_run(scenario: str = Form("approval")):
+    """Stage a synthetic scenario through the normal scheduler and engine.
+    Demo mode only; settlement remains simulated."""
     if MODE != "demo":
         raise HTTPException(409, "Synthetic one-action runs require demo mode")
+    if scenario not in ("approval", "risk_review", "parity_mismatch"):
+        raise HTTPException(422, "Unsupported demo scenario")
     if len(tasks) >= 8:
         raise HTTPException(429, "Runtime queue full; retry later")
     fixtures = [ROOT / "demo" / "dossier" / name for name in DEMO_RUN_FILES]
     if any(not path.is_file() or path.is_symlink() for path in fixtures):
         raise HTTPException(404, "Run python scripts/prepare_demo.py first")
+    terms = dict(DEMO_RUN_TERMS)
+    if scenario == "risk_review":
+        terms["monthly_debt_service"] = "50000.00"
+    if scenario == "parity_mismatch":
+        try:
+            rows = await asyncio.to_thread(read_statement, str(fixtures[2]))
+            receipt = next((row for row in rows if row["invoice_id"] and money(row["inflow"]) > 0), None)
+            if (receipt is None or receipt["invoice_id"] != "DEMO-INV-001"
+                    or money(receipt["inflow"]) != Decimal("100000.00")):
+                raise EvidenceError("Canonical demo receipt DEMO-INV-001 with inflow 100000.00 required")
+            receipt["inflow"] = str(money(receipt["inflow"]) - Decimal("0.01"))
+        except EvidenceError as exc:
+            raise HTTPException(409, str(exc))
     directory = WORKSPACE / "incoming" / secrets.token_hex(16)
     directory.mkdir(parents=True)
     sources = []
     for fixture in fixtures:
-        target = directory / fixture.name
-        shutil.copyfile(fixture, target)
+        if scenario == "parity_mismatch" and fixture.suffix == ".xlsx":
+            target = directory / "statement.csv"
+            with target.open("x", encoding="utf-8", newline="") as output:
+                writer = csv.DictWriter(output, fieldnames=("transaction_id", "invoice_id", "currency", "inflow", "outflow", "date"),
+                                        extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+        else:
+            target = directory / fixture.name
+            shutil.copyfile(fixture, target)
         await asyncio.to_thread(inspect_upload, target)
-        sources.append({"name": fixture.name, "sha256": hash_file(target)})
-    return schedule_job(directory, dict(DEMO_RUN_TERMS), sources)
+        sources.append({"name": target.name, "sha256": hash_file(target)})
+    accepted = schedule_job(directory, terms, sources)
+    store.update(accepted["job_id"], demo_scenario=scenario)
+    return accepted
 
 
 @app.get("/api/v2/jobs/{jid}", dependencies=[Depends(auth)])

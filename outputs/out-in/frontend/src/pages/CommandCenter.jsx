@@ -5,6 +5,7 @@ import { useOperator } from '../App.jsx';
 import { DEMO_DOSSIER_URL, downloadBlob, runDemo, submitBatch } from '../api.js';
 import { ArtifactButton, Notice, RiskGauge, StateBadge } from '../components.jsx';
 import useAgentStream from '../hooks/useAgentStream.js';
+import FeatureShowcase, { DemoLauncher } from '../FeatureShowcase.jsx';
 import { artifactsOf, isQuarantined, isTerminal, isVarianceReport, money, normalizeState, numberOrNull, percent, redact, varianceStatus } from '../model.js';
 
 const MIB = 1024 * 1024;
@@ -19,6 +20,9 @@ const STAGES = [
 ];
 
 function stageFor(text) {
+  // Bundle verification belongs to packaging, not financial reconciliation.
+  if (/verify_bundle_integrity|compile_tnc_agreement|SETTLING|COMPLETED/i.test(text || '')) return 3;
+  if (/SELF_HEALING/i.test(text || '')) return 0;
   return STAGES.findIndex((stage) => stage.match.test(text || ''));
 }
 
@@ -53,7 +57,7 @@ function Dag({ job, events }) {
       </div>
       <div className={`feedback-loop ${rollbackActive ? 'rollback-active' : ''}`}>
         <svg viewBox="0 0 800 40" preserveAspectRatio="none" aria-hidden="true"><path d="M700 0 V22 Q700 32 690 32 H310 Q300 32 300 22 V8" /><path d="M294 15 L300 8 L306 15" /></svg>
-        <span><RotateCcw size={12} />{rollback ? `ROLLBACK CYCLE ${rollback.cycle ?? 'NOT REPORTED'} · RECONCILIATION RECHECK` : 'VARIANCE DETECTED → RETURN TO RECONCILIATION'}</span>
+        <span><RotateCcw size={12} />{rollback ? Number(rollback.cycle) > 3 ? 'FOURTH FAILED AUDIT · REPAIR BUDGET EXHAUSTED' : `FAILED AUDIT ${rollback.cycle ?? 'NOT REPORTED'} · RETURN TO EVIDENCE` : 'AUDIT FAILURE → RETURN TO EVIDENCE'}</span>
       </div>
       <div className="pipeline-footnote"><span className="status-dot" />Stage activity is mapped from backend state, agent and tool events. Dossier PDFs normalize in parallel; committed bundles are self-verified before COMPLETED. Unknown stages remain unverified.</div>
     </section>
@@ -83,15 +87,19 @@ function DecisionMemo({ memo }) {
 }
 
 function Telemetry({ events, sequence, apiKey }) {
+  const missingHashes = events.some((event) => !/^[a-f0-9]{64}$/i.test(event.sha256 || '') || !/^[a-f0-9]{64}$/i.test(event.previous_hash || ''));
+  const linksMatch = !missingHashes && events.slice(1).every((event, index) => event.previous_hash === events[index].sha256);
+  const chainScope = events[0]?.previous_hash === '0'.repeat(64) ? 'FROM GENESIS' : 'RECEIVED SEGMENT ONLY';
   return (
     <details className="panel telemetry-panel">
       <summary><span className="telemetry-label"><Activity size={18} /><span><strong>Audit telemetry</strong><small>Tool executions, state transitions & rollback evidence</small></span></span><span className="telemetry-meta">{events.length} EVENTS<span className="mono">SEQ {sequence}</span><ChevronDown size={17} /></span></summary>
       <div className="telemetry-content">
-        <p className="metric-note">Last 300 non-heartbeat events, in memory only. Sensitive fields are redacted. The server snapshot is the source of truth.</p>
+        <p className="metric-note">Last 300 non-heartbeat events, in memory only. Sensitive fields are redacted. The server snapshot is the source of truth. Sequence numbers are global across jobs; gaps alone do not prove missing job events.</p>
+        {events.length > 0 && <p className={`metric-note ${linksMatch ? 'positive' : 'warning'}`}>{linksMatch ? 'PREVIOUS-HASH LINKS MATCH' : 'CHAIN LINKS UNVERIFIED / MISMATCH'} · {chainScope}. Link comparison only; digests and signatures are not independently verified here, and the local chain has no external anchor.</p>}
         {events.length === 0 ? <div className="empty-inline">No audit events received for this run.</div> :
           <ol className="event-list">{[...events].reverse().map((event) => <li key={event.seq}>
             <div className="event-line"><span className="event-seq">#{event.seq}</span><span className={`event-type ${event.type === 'ROLLBACK_TRIGGERED' ? 'negative' : ''}`}>{event.type.replaceAll('_', ' ')}</span><time dateTime={event.timestamp}>{event.timestamp && !Number.isNaN(Date.parse(event.timestamp)) ? new Date(event.timestamp).toLocaleTimeString() : 'Time not reported'}</time></div>
-            <pre>{redact(event.payload, apiKey)}</pre>
+            <div className="event-hashes"><span>SHA-256 <code>{event.sha256 || 'Not reported'}</code></span><span>Previous <code>{event.previous_hash || 'Not reported'}</code></span></div><pre>{redact(event.payload, apiKey)}</pre>
           </li>)}</ol>}
       </div>
     </details>
@@ -115,6 +123,8 @@ export default function CommandCenter() {
   const [demoBusy, setDemoBusy] = useState(false);
   const [demoError, setDemoError] = useState('');
   const [demoRunBusy, setDemoRunBusy] = useState(false);
+  const [demoScenario, setDemoScenario] = useState('approval');
+  const demoLock = useRef(false);
   const fileInput = useRef(null);
   const submission = useRef(null);
   const submitLock = useRef(false);
@@ -131,13 +141,15 @@ export default function CommandCenter() {
   const totalSize = files.reduce((sum, file) => sum + file.size, 0);
   const metrics = job?.metrics || {};
   const variance = varianceStatus(metrics.variance);
-  const reportedPassed = typeof metrics.passed === 'boolean' ? metrics.passed ? 'PASS' : 'FAIL' : 'UNKNOWN';
+  const auditEvent = events.filter((event) => event.type === 'METRICS' && typeof event.payload?.passed === 'boolean' && !('default_probability' in event.payload)).at(-1);
+  const reportedPassed = typeof auditEvent?.payload?.passed === 'boolean' ? auditEvent.payload.passed ? 'PASS' : 'FAIL' : 'UNKNOWN';
   const dsr = numberOrNull(metrics.dsr);
   const artifacts = artifactsOf(job?.artifacts);
   const varianceReports = artifacts.filter(isVarianceReport);
   const vaultArtifacts = artifacts.filter((artifact) => !isVarianceReport(artifact));
   const completed = normalizeState(job?.state) === 'COMPLETED';
-  const quarantined = isQuarantined(job?.state);
+  const quarantined = normalizeState(job?.state) === 'QUARANTINED';
+  const reviewRequired = isQuarantined(job?.state) && !quarantined;
 
   function addFiles(incoming) {
     if (busy) return;
@@ -200,11 +212,12 @@ export default function CommandCenter() {
   }
 
   async function executeDemo() {
-    if (demoRunBusy || busy || keyMissing) return;
+    if (demoLock.current || demoRunBusy || busy || keyMissing || config?.mode !== 'demo') return;
+    demoLock.current = true;
     setDemoRunBusy(true);
     setDemoError('');
     try {
-      const response = await runDemo(apiKey);
+      const response = await runDemo(apiKey, undefined, demoScenario);
       if (!response || typeof response.job_id !== 'string' || !response.job_id ||
         typeof response.stream_token !== 'string' || !response.stream_token) {
         throw new Error('The backend did not return a valid job id and stream token.');
@@ -212,7 +225,7 @@ export default function CommandCenter() {
       if (mounted.current) rememberRun(response);
     } catch (reason) {
       if (mounted.current) setDemoError(reason.message);
-    } finally { if (mounted.current) setDemoRunBusy(false); }
+    } finally { demoLock.current = false; if (mounted.current) setDemoRunBusy(false); }
   }
 
   return (
@@ -221,13 +234,14 @@ export default function CommandCenter() {
         <div><span className="eyebrow">OUT&IN / CREDIT INTELLIGENCE</span><h1>Mission control<span className="heading-dot">.</span></h1><p>From financial evidence to a defensible credit decision.</p></div>
         <div className="heading-actions">
           <button type="button" className="secondary-button dossier-button" onClick={downloadDemo} disabled={demoBusy}>{demoBusy ? <LoaderCircle size={16} className="spin" /> : <ArrowDownToLine size={16} />}Download demo dossier<ArrowUpRight size={14} /></button>
-          <button type="button" className="secondary-button dossier-button" onClick={executeDemo} disabled={demoRunBusy || busy || keyMissing || config?.mode !== 'demo'} title="One action: the backend stages its synthetic dossier with canonical demo terms and runs the full pipeline.">{demoRunBusy ? <LoaderCircle size={16} className="spin" /> : <Play size={16} fill="currentColor" />}Run end-to-end demo<ArrowRight size={14} /></button>
+          <button type="button" className="secondary-button dossier-button" onClick={executeDemo} disabled={demoRunBusy || busy || keyMissing || config?.mode !== 'demo'} title="Runs the selected synthetic scenario through the unchanged deterministic engine and safety gates.">{demoRunBusy ? <LoaderCircle size={16} className="spin" /> : <Play size={16} fill="currentColor" />}Run selected scenario<ArrowRight size={14} /></button>
         </div>
       </section>
       {configError && <Notice action={<button className="text-button" onClick={retryConfig}>Retry configuration</button>}>{configError}</Notice>}
       {demoError && <Notice>{demoError}</Notice>}
       {storageError && <Notice tone="warning">{storageError}</Notice>}
       {keyMissing && <Notice tone="warning">This backend requires an API key. Enter it in the operator field above. It will never be persisted.</Notice>}
+      <DemoLauncher onRun={executeDemo} busy={demoRunBusy || busy} disabled={keyMissing || config?.mode !== 'demo'} scenario={demoScenario} setScenario={setDemoScenario} />
 
       <div className="command-grid">
         <section className="panel intake-panel">
@@ -267,21 +281,23 @@ export default function CommandCenter() {
           </section>
           <Dag job={job} events={events} />
           <section className="metrics-grid" aria-label="Live underwriting metrics">
-            <div className="panel variance-panel"><span className="eyebrow">RECONCILIATION VARIANCE</span><div className="metric-heading"><h2>Exact means exact.</h2><ScanLine size={18} /></div><div className={`variance-value ${variance === 'FAIL' ? 'negative' : ''}`}>{variance === 'UNKNOWN' ? '—' : variance === 'PASS' ? '0' : String(metrics.variance)}</div><div className={`metric-status ${variance === 'PASS' ? 'positive' : variance === 'FAIL' ? 'negative' : 'neutral'}`}>{variance === 'PASS' ? <Check size={13} /> : <Circle size={11} />}{variance === 'UNKNOWN' ? 'UNKNOWN · NOT A PASS' : variance}</div><p className="metric-note">Pass only when variance is exactly 0.<br />No tolerance. No rounded reconciliation.</p><div className="backend-verdict"><span>Backend verdict</span><strong className={reportedPassed === 'PASS' ? 'positive' : reportedPassed === 'FAIL' ? 'negative' : 'muted'}>{reportedPassed}</strong></div></div>
+            <div className="panel variance-panel"><span className="eyebrow">RECONCILIATION VARIANCE</span><div className="metric-heading"><h2>Exact means exact.</h2><ScanLine size={18} /></div><div className={`variance-value ${variance === 'FAIL' ? 'negative' : ''}`}>{variance === 'UNKNOWN' ? '—' : variance === 'PASS' ? '0' : String(metrics.variance)}</div><div className={`metric-status ${variance === 'PASS' ? 'positive' : variance === 'FAIL' ? 'negative' : 'neutral'}`}>{variance === 'PASS' ? <Check size={13} /> : <Circle size={11} />}{variance === 'UNKNOWN' ? 'UNKNOWN · NOT A PASS' : variance === 'PASS' ? 'ZERO MONETARY VARIANCE' : 'NONZERO VARIANCE'}</div><p className="metric-note">Money requires exactly zero variance.<br />Delivery gates must also pass.</p><div className="backend-verdict"><span>Last observed audit verdict</span><strong className={reportedPassed === 'PASS' ? 'positive' : reportedPassed === 'FAIL' ? 'negative' : 'muted'}>{reportedPassed}</strong></div></div>
             <div className="panel risk-panel"><div className="risk-heading"><span className="eyebrow">CREDIT RISK</span><ShieldCheck size={17} className="muted" /></div><RiskGauge probability={metrics.default_probability} /></div>
           </section>
           <section className="panel decision-strip" aria-label="Reported credit limits"><div><span className="eyebrow">DEBT SERVICE RATIO</span><strong>{dsr === null || dsr < 0 ? 'Not reported' : percent(dsr)}</strong><small>Backend-reported ratio</small></div><div><span className="eyebrow">PROPOSED LIMIT</span><strong>{money(metrics.proposed_limit)}</strong><small>Proposal only · not approval</small></div><div><span className="eyebrow">APPROVED LIMIT</span><strong>{money(metrics.approved_limit)}</strong><small>Backend-reported · no disbursement</small></div></section>
-          <DecisionMemo memo={job?.decision_memo} />
+          {(completed || reviewRequired) && <DecisionMemo memo={job?.decision_memo} />}
           <div className="stream-status" aria-live="polite"><span className="status-dot" /><span>{connection.status.replaceAll('-', ' ').toUpperCase()}{connection.delay ? ` · RETRY ${connection.attempts}/6 IN ${connection.delay / 1000}s` : ''}</span><span className="mono">SEQ {sequence}</span>{selectedRun && <button className="text-button" onClick={reconnect}>Reconnect<RefreshCw size={12} /></button>}</div>
           {error && <Notice action={<button className="text-button" onClick={refresh}>Refresh snapshot</button>}>{error}</Notice>}
           {job?.error && <Notice>{redact(job.error, apiKey)}</Notice>}
         </div>
       </div>
 
-      {quarantined && <section className="panel quarantine-panel"><div className="panel-heading"><div><span className="eyebrow warning">QUARANTINE / HUMAN OVERSIGHT</span><h2>Evidence held for review.</h2></div><StateBadge state={job?.state} /></div><p>Decision artifacts remain locked. Reconciliation quarantine prohibits underwriting and settlement; no automatic haircut is offered. Review the variance report and retained source evidence without altering values to force parity.</p>{varianceReports.length > 0 ? varianceReports.map((artifact) => <ArtifactButton key={artifact.url} artifact={artifact} apiKey={apiKey} />) : <div className="empty-inline">No quarantine variance report has been returned.</div>}<Link className="text-link" to="/admin/review">Open the human review queue<ArrowUpRight size={15} /></Link></section>}
+      {quarantined && <section className="panel quarantine-panel"><div className="panel-heading"><div><span className="eyebrow warning">QUARANTINE / HUMAN OVERSIGHT</span><h2>Evidence held for review.</h2></div><StateBadge state={job?.state} /></div><p>Decision artifacts remain locked. Reconciliation quarantine prohibits underwriting and settlement; no automatic haircut is offered. Review the variance report and retained source evidence without altering values to force parity.</p>{varianceReports.length > 0 ? varianceReports.map((artifact) => <ArtifactButton key={artifact.url} artifact={artifact} apiKey={apiKey} />) : <div className="empty-inline">No quarantine variance report has been returned.</div>}<p className="metric-note">Quarantine is an evidence failure. The credit review queue is separate; this run cannot bypass reconciliation.</p></section>}
+      {reviewRequired && <section className="panel quarantine-panel"><div className="panel-heading"><div><span className="eyebrow warning">CREDIT POLICY / HUMAN REVIEW</span><h2>Reconciled evidence. Credit not approved.</h2></div><StateBadge state={job?.state} /></div><p>A deterministic credit gate failed. No agreement, decision bundle or simulated wallet entry is created. A proposed limit is advisory only and does not authorize financing.</p><Link className="text-link" to="/admin/review">Open the credit review queue<ArrowUpRight size={15} /></Link></section>}
+      <FeatureShowcase job={job} events={events} config={config} apiKey={apiKey} />
       {job?.myinvois_sources?.length > 0 && <section className="panel"><div className="panel-heading"><h2>LHDN source snapshots</h2></div><p className="metric-note">Authenticated API response snapshots, not continuous status assurance or independent verification of LHDN signatures. Sensitive invoice data: authorized operator downloads only.</p>{job.myinvois_sources.map((source) => <ArtifactButton key={source.name} artifact={{ name: source.name, url: `/api/v2/jobs/${job.id}/myinvois-sources/${encodeURIComponent(source.name.split('/').pop())}` }} apiKey={apiKey} />)}</section>}
       {completed && <section className="panel vault-panel"><div className="panel-heading"><div><span className="eyebrow">SEALED / COMPLETED RUN</span><h2>Artifact vault</h2></div><div className="heading-actions"><span className="subtle-chip"><FolderLock size={13} />{vaultArtifacts.length} ARTIFACTS</span>{metrics.self_check?.verified === true && <span className="subtle-chip self-check-chip"><ShieldCheck size={13} />SELF-CHECK VERIFIED</span>}</div></div><p className="metric-note">Available only after the backend reports COMPLETED. Downloads use your in-memory API key.{metrics.self_check?.verified === true ? ` The backend re-verified the committed bundle itself: ${metrics.self_check.outputs_checked ?? '?'} payload hashes, 3 Ed25519 signatures and ${metrics.self_check.sources_checked ?? '?'} declared sources checked.` : ''}</p>{vaultArtifacts.length > 0 ? vaultArtifacts.map((artifact) => <ArtifactButton key={artifact.url} artifact={artifact} apiKey={apiKey} />) : <div className="empty-inline">The completed snapshot contains no decision artifacts.</div>}{varianceReports.length > 0 && <details className="reconciliation-reports"><summary>Reconciliation reports<ChevronDown size={15} /></summary>{varianceReports.map((artifact) => <ArtifactButton key={artifact.url} artifact={artifact} apiKey={apiKey} />)}</details>}</section>}
-      {!completed && !quarantined && <div className="vault-locked"><FolderLock size={15} /><span>Decision artifacts are locked until the run reaches COMPLETED.</span></div>}
+      {!completed && !quarantined && !reviewRequired && <div className="vault-locked"><FolderLock size={15} /><span>Decision artifacts are locked until the run reaches COMPLETED.</span></div>}
       <Telemetry events={events} sequence={sequence} apiKey={apiKey} />
       <section className="panel history-panel"><div className="panel-heading"><div><span className="eyebrow">THIS BROWSER SESSION</span><h2><History size={18} />Run history</h2></div><span className="muted small">IDs & tokens only · {history.length} / 20</span></div>{history.length === 0 ? <div className="empty-inline"><Clock3 size={17} />Completed and active run IDs will appear here after execution. No metrics or API keys are stored.</div> : <ul className="history-list">{history.map((run, index) => <li key={run.job_id}><button disabled={submitting} className={run.job_id === selectedRun?.job_id ? 'selected' : ''} onClick={() => setSelectedRun(run)}><span className="history-number">{String(index + 1).padStart(2, '0')}</span><span className="mono">{run.job_id}</span><span className="history-action">{run.job_id === selectedRun?.job_id ? 'MONITORING' : 'OPEN RUN'}<ArrowUpRight size={14} /></span></button></li>)}</ul>}</section>
     </main>

@@ -1,0 +1,91 @@
+{
+  "scope": "local API, recorded WebSocket replay and payload hashes",
+  "synthetic_inputs": true,
+  "scenarios": [
+    {
+      "scenario": "approval",
+      "job_id": "42e6bb3156c9f39d1a39bf853979eb3e",
+      "state": "COMPLETED",
+      "events": 30,
+      "audit_passed": true,
+      "variance": "0",
+      "artifact_count": 9,
+      "previous_hash_links_match": true,
+      "payloads_checked": 7,
+      "modified_copies_rejected": true,
+      "repayment_rows": 12
+    },
+    {
+      "scenario": "risk_review",
+      "job_id": "9dd43bd543669e3a405529a1cbe0f488",
+      "state": "REVIEW_REQUIRED",
+      "events": 15,
+      "audit_passed": true,
+      "variance": "0",
+      "artifact_count": 0,
+      "previous_hash_links_match": true,
+      "risk_gates": {
+        "probability_le_0_12": false,
+        "all_in_dsr_le_0_45": false
+      }
+    },
+    {
+      "scenario": "parity_mismatch",
+      "job_id": "45a29ecf163daa87a9fc8476c53bb5dd",
+      "state": "QUARANTINED",
+      "events": 42,
+      "audit_passed": false,
+      "variance": "0.01",
+      "artifact_count": 1,
+      "previous_hash_links_match": true,
+      "repair_cycles": [
+        1,
+        2,
+        3
+      ],
+      "audit_attempts": 4
+    }
+  ],
+  "success": true,
+  "recorded_regressions": {
+    "date": "2026-10-11",
+    "backend_passed": 999,
+    "backend_warnings": 1,
+    "frontend_passed": 7,
+    "production_build_passed": true,
+    "python": "3.14.4",
+    "node": "22.22.2"
+  },
+  "recorded_browser_checks": {
+    "approval_artifacts": 9,
+    "approval_installments": 12,
+    "approval_payload_hash_matches": 7,
+    "modified_in_memory_copy_rejected": true,
+    "risk_review_decision_artifacts": 0,
+    "quarantine_variance": "0.01",
+    "quarantine_repair_cycles": 3,
+    "completed_history_replayed_events": 30,
+    "mobile_viewport_width": 390,
+    "mobile_document_width": 375,
+    "feature_cards": 9,
+    "note": "Recorded from separate real-browser checks; the smoke script itself is API-only. Final browser diagnostics/close command encountered a transport timeout after screenshots and scenario checks succeeded."
+  },
+  "health": {
+    "status": "ok",
+    "mode": "demo",
+    "real_funds": false
+  },
+  "real_funds": false,
+  "completed_history_replay": {
+    "job_id": "42e6bb3156c9f39d1a39bf853979eb3e",
+    "events": 30,
+    "terminal_state": "COMPLETED"
+  },
+  "original_fixtures_unchanged": true,
+  "limitations": [
+    "Synthetic inputs and models; simulation only.",
+    "This script checks API and stream replay, not browser rendering.",
+    "Hash-link comparison is not event digest verification or external anchoring.",
+    "Payload checks do not independently authenticate providers or legal identities."
+  ]
+}

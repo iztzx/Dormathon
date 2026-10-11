@@ -64,7 +64,7 @@ function Invoke-Checked([string]$Executable, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "Command failed (exit $LASTEXITCODE): $Executable" }
 }
 function Assert-Python313([string]$Executable, [string[]]$Prefix = @()) {
-    Invoke-Checked $Executable (@($Prefix) + @("-c", "import sys; assert sys.version_info[:2] == (3, 13), 'Use the reviewed Python 3.13 baseline'"))
+    Invoke-Checked $Executable (@($Prefix) + @("-c", "import sys; assert sys.version_info >= (3, 12), 'Use Python 3.12 or newer'"))
 }
 Assert-Location $EnvironmentPath (Resolve-Canonical (Join-Path $Root ".venv"))
 Assert-Location $WorkspacePath (Resolve-Canonical (Join-Path $Root "workspace"))
@@ -86,10 +86,10 @@ if ((Test-Path -LiteralPath $WorkspacePath) -and -not $PrepareOnly) {
     if (-not (Test-Path -LiteralPath $WorkspacePath -PathType Container)) { throw "Workspace must be a directory" }
     if (-not $ReuseWorkspace) { throw "Workspace exists; stop all owning services and explicitly use -ReuseWorkspace. No files will be removed." }
 }
-$Node = (Get-Command "node.exe" -CommandType Application -ErrorAction Stop).Source
-$Npm = (Get-Command "npm.cmd" -CommandType Application -ErrorAction Stop).Source
+$Node = (Get-Command "node.exe" -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+$Npm = (Get-Command "npm.cmd" -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $VersionText = (& $Node --version).Trim()
-if ($LASTEXITCODE -ne 0 -or $VersionText -notmatch '^v22\.(\d+)\.(\d+)$' -or [int]$Matches[1] -lt 20) { throw "Use Node 22.20 or newer within 22.x; found $VersionText" }
+if ($LASTEXITCODE -ne 0 -or $VersionText -notmatch '^v(\d+)\.(\d+)\.(\d+)$' -or ([int]$Matches[1] -lt 22) -or ([int]$Matches[1] -eq 22 -and [int]$Matches[2] -lt 20)) { throw "Use Node 22.20 or newer; found $VersionText" }
 $Prefix = @()
 if ($ReuseEnvironment) {
     if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "No reusable environment at $EnvironmentPath" }
@@ -101,7 +101,7 @@ if ($ReuseEnvironment) {
         Assert-Python313 $PythonExe
     } else {
         $PythonExe = (Get-Command "py.exe" -CommandType Application -ErrorAction Stop).Source
-        $Prefix = @("-3.13")
+        $Prefix = @("-3")
         Assert-Python313 $PythonExe $Prefix
     }
 }

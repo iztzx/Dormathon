@@ -7,7 +7,7 @@ const MAX_EVENTS = 300;
 const BASE_DELAY_MS = 1000;
 const MAX_DELAY_MS = 30000;
 
-function applyEvent(job, event) {
+export function applyEvent(job, event) {
   const payload = event.payload || {};
   const current = job || { id: event.job_id, state: 'UNKNOWN', metrics: {}, artifacts: [] };
   switch (event.type) {
@@ -20,8 +20,13 @@ function applyEvent(job, event) {
       };
     case 'STATE_TRANSITION':
       return { ...current, state: payload.state ?? current.state, agent: payload.agent ?? current.agent };
-    case 'METRICS':
-      return { ...current, metrics: { ...current.metrics, ...payload } };
+    case 'METRICS': {
+      const metrics = { ...current.metrics, ...payload };
+      // Replayed audit verdicts must not overwrite a newer credit verdict.
+      if (typeof payload.passed === 'boolean' && !('default_probability' in payload) &&
+          current.metrics?.default_probability != null) metrics.passed = current.metrics.passed;
+      return { ...current, metrics };
+    }
     case 'ROLLBACK_TRIGGERED':
       return {
         ...current,
@@ -120,7 +125,11 @@ export default function useAgentStream(run, apiKey) {
           });
           commit(next);
           setError('');
-          if (isTerminal(next.state)) stopForTerminal();
+          // A terminal REST snapshot must not prevent replay of the actual
+          // historical events. Stop only after the terminal event was received,
+          // or when the caller has no scoped stream token.
+          if (isTerminal(next.state) && (forceFinal || !token || bufferedEvents.some((event) =>
+            event.type === 'STATE_TRANSITION' && isTerminal(event.payload?.state)))) stopForTerminal();
           return next;
         } catch (reason) {
           if (!disposed && reason.name !== 'AbortError') setError(reason.message);
@@ -206,7 +215,7 @@ export default function useAgentStream(run, apiKey) {
         }
         // Missing/replayed history is recovered by the authoritative REST snapshot.
         if (event.seq > previousSequence + 1) void fetchSnapshot();
-        if (isTerminal(currentJob?.state)) requestFinalSnapshot();
+        if (event.type === 'STATE_TRANSITION' && isTerminal(event.payload?.state)) requestFinalSnapshot();
       };
       socket.onerror = () => {
         if (!disposed) setError('The stream was interrupted. Reconnecting with the last sequence.');

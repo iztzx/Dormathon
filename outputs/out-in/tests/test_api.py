@@ -7,6 +7,7 @@ socket access are isolated. TestClient's Windows event-loop socketpair is the
 sole permitted socket connection. Every stream has a deadline/event budget.
 """
 
+import csv
 import hashlib
 import importlib.util
 import io
@@ -29,6 +30,7 @@ from openpyxl import load_workbook
 from starlette.websockets import WebSocketDisconnect
 
 from scripts.verify_manifest import VerificationError, verify_manifest
+from tools.reconciliation_tool import money, read_statement
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -652,12 +654,31 @@ def test_myinvois_unknown_sources_and_tampering_fail_closed(api, synthetic_myinv
 
 
 def test_demo_run_requires_operator_key(api):
-    assert api.client.post("/api/v2/demo-run").status_code == 401
-    assert api.client.post("/api/v2/demo-run", headers={"X-API-Key": "invalid-synthetic-key"}).status_code == 401
+    before = len(api.module.store.list())
+    incoming = set((api.workspace / "incoming").glob("*"))
+    for headers in ({}, {"X-API-Key": "invalid-synthetic-key"}):
+        for data in ({}, {"scenario": "unsupported"}):
+            response = api.client.post("/api/v2/demo-run", headers=headers, data=data)
+            assert response.status_code == 401
+    assert len(api.module.store.list()) == before
+    assert set((api.workspace / "incoming").glob("*")) == incoming
 
 
-def test_demo_run_one_action_completes_end_to_end(api):
-    response = api.client.post("/api/v2/demo-run", headers=api.headers)
+@pytest.mark.parametrize("scenario", ["unsupported", "Approval", "../approval"])
+def test_demo_run_invalid_scenario_creates_no_job_or_incoming(api, scenario):
+    before = len(api.module.store.list())
+    incoming = set((api.workspace / "incoming").glob("*"))
+    incoming_exists = (api.workspace / "incoming").exists()
+    response = api.client.post("/api/v2/demo-run", headers=api.headers, data={"scenario": scenario})
+    assert_rejected_without_job(api, response, before)
+    assert response.json() == {"detail": "Unsupported demo scenario"}
+    assert set((api.workspace / "incoming").glob("*")) == incoming
+    assert (api.workspace / "incoming").exists() == incoming_exists
+
+
+@pytest.mark.parametrize("data", [{}, {"scenario": "approval"}], ids=["no-body", "explicit-approval"])
+def test_demo_run_one_action_completes_end_to_end(api, data):
+    response = api.client.post("/api/v2/demo-run", headers=api.headers, data=data)
     assert response.status_code == 202, response.text
     accepted = response.json()
     assert accepted["state"] == "QUEUED"
@@ -673,5 +694,80 @@ def test_demo_run_one_action_completes_end_to_end(api):
     # One-action intake must land exactly the three generated fixtures.
     inputs = sorted(path.name for path in (case.directory / "inputs").iterdir())
     assert inputs == ["invoice.pdf", "packing_list.pdf", "statement.xlsx"]
-    for name in inputs:
+    assert set(accepted) == {"job_id", "stream_token", "state"}
+    stored = api.module.store.get(accepted["job_id"])
+    assert case.job["demo_scenario"] == stored["demo_scenario"] == "approval"
+    assert stored["terms"] == api.module.DEMO_RUN_TERMS
+    for source in stored["sources"]:
+        name = source["name"]
         assert (case.directory / "inputs" / name).read_bytes() == api.originals[name]
+        assert source["sha256"] == hashlib.sha256(api.originals[name]).hexdigest()
+    for name, original in api.originals.items():
+        assert (ROOT / "demo/dossier" / name).read_bytes() == original
+
+
+def test_demo_run_risk_review_uses_real_model_without_artifact_or_wallet(api):
+    response = api.client.post("/api/v2/demo-run", headers=api.headers, data={"scenario": "risk_review"})
+    assert response.status_code == 202, response.text
+    case = await_terminal(api, response.json())
+    record_case("demo_risk_review", api, case)
+    assert case.job["demo_scenario"] == "risk_review"
+    test_real_high_operator_debt_requires_review_without_artifact_or_payout(api, case)
+    assert case.job["metrics"]["is_demo_model"] is True
+    tools = Counter(event["payload"]["tool"] for event in case.events
+                    if event["type"] == "TOOL_EXECUTION" and event["payload"]["status"] == "COMPLETED")
+    assert tools == {"run_ocr_normalizer": 2, "run_excel_reconciliation": 1, "evaluate_credit_ml": 1}
+    stored = api.module.store.get(case.accepted["job_id"])
+    assert stored["demo_scenario"] == "risk_review"
+    assert stored["terms"] == {**api.module.DEMO_RUN_TERMS, "monthly_debt_service": "50000.00"}
+    assert sorted(path.name for path in (case.directory / "inputs").iterdir()) == sorted(api.originals)
+    for source in stored["sources"]:
+        name = source["name"]
+        assert (case.directory / "inputs" / name).read_bytes() == api.originals[name]
+        assert source["sha256"] == hashlib.sha256(api.originals[name]).hexdigest()
+    for name, original in api.originals.items():
+        assert (ROOT / "demo/dossier" / name).read_bytes() == original
+
+
+def test_demo_run_parity_mismatch_csv_repairs_and_audits_without_wallet(api):
+    originals = read_statement(str(ROOT / "demo/dossier/statement.xlsx"))
+    receipt_index = next(index for index, row in enumerate(originals)
+                         if row["invoice_id"] and money(row["inflow"]) > 0)
+    assert originals[receipt_index]["invoice_id"] == "DEMO-INV-001"
+    assert money(originals[receipt_index]["inflow"]) == Decimal("100000.00")
+    ingested = {path: path.read_bytes() for path in (api.workspace / "jobs").glob("*/inputs/*")}
+    response = api.client.post("/api/v2/demo-run", headers=api.headers, data={"scenario": "parity_mismatch"})
+    assert response.status_code == 202, response.text
+    case = await_terminal(api, response.json())
+    record_case("demo_parity_mismatch", api, case)
+    assert case.job["demo_scenario"] == "parity_mismatch"
+    test_real_one_cent_mismatch_three_reslices_then_quarantine_report_no_wallet(api, case)
+    inputs = case.directory / "inputs"
+    assert sorted(path.name for path in inputs.iterdir()) == ["invoice.pdf", "packing_list.pdf", "statement.csv"]
+    columns = ["transaction_id", "invoice_id", "currency", "inflow", "outflow", "date"]
+    expected = [{key: row[key] for key in columns} for row in originals]
+    expected[receipt_index]["inflow"] = str(money(expected[receipt_index]["inflow"]) - Decimal("0.01"))
+    with (inputs / "statement.csv").open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        assert reader.fieldnames == columns
+        assert list(reader) == expected
+    assert read_statement(str(inputs / "statement.csv")) == expected
+    stored = api.module.store.get(case.accepted["job_id"])
+    assert stored["demo_scenario"] == "parity_mismatch"
+    assert stored["terms"] == api.module.DEMO_RUN_TERMS
+    assert {source["name"] for source in stored["sources"]} == {path.name for path in inputs.iterdir()}
+    for source in stored["sources"]:
+        content = (inputs / source["name"]).read_bytes()
+        assert source["sha256"] == hashlib.sha256(content).hexdigest()
+        if source["name"].endswith(".pdf"):
+            assert content == api.originals[source["name"]]
+    assert sorted(path.name for path in (case.directory / "evidence").glob("audit-*.json")) == [
+        "audit-0.json", "audit-1.json", "audit-2.json", "audit-3.json"]
+    for cycle in range(4):
+        audit = json.loads((case.directory / "evidence" / f"audit-{cycle}.json").read_text(encoding="utf-8"))
+        assert audit["passed"] is False and Decimal(audit["variance"]) == Decimal("0.01")
+        assert audit["bank_rows"] == expected
+    for name, original in api.originals.items():
+        assert (ROOT / "demo/dossier" / name).read_bytes() == original
+    for path, content in ingested.items():
+        assert path.read_bytes() == content

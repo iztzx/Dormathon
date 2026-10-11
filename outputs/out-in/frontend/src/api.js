@@ -39,8 +39,10 @@ export function submitBatch(files, terms, apiKey, signal) {
 
 // One action, end-to-end: the backend stages its generated synthetic dossier
 // with the canonical demo terms. No files or credentials leave the browser.
-export function runDemo(apiKey, signal) {
-  return requestJson('/demo-run', { method: 'POST', apiKey, signal });
+export function runDemo(apiKey, signal, scenario = 'approval') {
+  const body = new FormData();
+  body.append('scenario', scenario);
+  return requestJson('/demo-run', { method: 'POST', body, apiKey, signal });
 }
 
 export async function downloadBlob(path, filename, apiKey = '', signal) {
@@ -68,6 +70,18 @@ export async function downloadBlob(path, filename, apiKey = '', signal) {
   anchor.click();
   anchor.remove();
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
+
+export async function readArtifact(path, apiKey, signal) {
+  const url = new URL(path, window.location.origin);
+  if (url.origin !== window.location.origin || !url.pathname.startsWith('/api/')) {
+    throw new Error('Evidence inspection requires a same-origin /api/ URL.');
+  }
+  const response = await fetch(url, {
+    headers: authHeaders(apiKey), signal, credentials: 'same-origin', redirect: 'error', cache: 'no-store',
+  });
+  if (!response.ok) throw new Error(`Evidence inspection failed (HTTP ${response.status}).`);
+  return response.arrayBuffer();
 }
 
 export const DEMO_DOSSIER_URL = `${API_ROOT}/demo-dossier`;

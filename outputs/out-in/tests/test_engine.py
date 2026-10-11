@@ -1475,3 +1475,34 @@ def test_bundle_selfcheck_fails_closed_on_tampered_bundle(signed_bundle):
 def test_bundle_selfcheck_fails_closed_when_bundle_missing(tmp_path):
     with pytest.raises(EvidenceError, match="missing"):
         verify_bundle_integrity(tmp_path / "synthetic-job")
+
+
+def test_pdfium_repairs_hold_process_lock_but_initial_text_extraction_does_not(monkeypatch):
+    import threading
+    from tools import ocr_tool
+
+    lock = threading.RLock()
+    observations = []
+    sentinel = object()
+
+    def normalize(path, regions, cycle):
+        acquired = []
+        def probe():
+            available = lock.acquire(blocking=False)
+            acquired.append(available)
+            if available:
+                lock.release()
+        worker = threading.Thread(target=probe)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        observations.append((path, regions, cycle, acquired))
+        return sentinel
+
+    monkeypatch.setattr(ocr_tool, "_PDFIUM_LOCK", lock)
+    monkeypatch.setattr(ocr_tool, "_normalize_pdf", normalize)
+    assert ocr_tool.run_ocr_normalizer("synthetic.pdf") is sentinel
+    for cycle in (1, 2, 3):
+        assert ocr_tool.run_ocr_normalizer("synthetic.pdf", [], cycle) is sentinel
+    assert [row[3] for row in observations] == [[True], [False], [False], [False]]
+    assert [row[2] for row in observations] == [0, 1, 2, 3]
